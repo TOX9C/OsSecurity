@@ -55,11 +55,6 @@ def main():
                         mb_ps = bytes_diff / (1024 * 1024)
                         
                         name = get_process_name(pid)
-                        
-                        # DEBUG: Ensure script is seeing the 'dd' command
-                        if name == "dd" and mb_ps > 0:
-                            print(f"[Debug] Caught dd (PID {pid}) writing at {mb_ps:.2f} MB/s")
-
                         # Alert logic for threshold [cite: 37, 40]
                         if mb_ps > THRESHOLD_MBPS:
                             print(f"[Monitor] ALERT: PID {pid} ({name}) writing at {mb_ps:.2f} MB/s")
