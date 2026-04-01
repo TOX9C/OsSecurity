@@ -5,11 +5,11 @@ def get_drives():
     seen = set()
     driveList = []
     for i in result:
+        i = i.strip(" ")
         if i[0] in seen:
             continue
         else:
             seen.add(i[0])
             driveList.append(i)
-    print(driveList)
-    return
+    return driveList
 
