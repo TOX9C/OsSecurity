@@ -5,7 +5,7 @@
 IO_THRESHOLD_MBPS = 50.0
 
 # How many seconds of sustained high I/O before we escalate
-SUSPICIOUS_DURATION_SEC = 5.0
+SUSPICIOUS_DURATION_SEC = 3.0
 
 # How long before we consider an alert "stale" and reset to NORMAL
 # (i.e. the process stopped doing heavy I/O)

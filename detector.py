@@ -5,6 +5,7 @@ import queue
 import signal
 import logging
 import threading
+import subprocess
 from enum import Enum
 from dataclasses import dataclass, field
 
@@ -18,6 +19,13 @@ from config import (
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 log = logging.getLogger("Detector")
+
+# If a process writes above this multiplier of the threshold,
+# it's considered "extreme I/O" and killed immediately without
+# waiting for honeypot confirmation — no legitimate process
+# (outside the whitelist) should be writing this fast.
+EXTREME_IO_MULTIPLIER = 3.0
+EXTREME_IO_MBPS = IO_THRESHOLD_MBPS * EXTREME_IO_MULTIPLIER
 
 # ── State machine ─────────────────────────────────────────────────────────────
 class State(Enum):
@@ -44,6 +52,7 @@ class TrackedProcess:
     state: State = State.NORMAL
     state_since: float = field(default_factory=time.time)
     last_alert: float = field(default_factory=time.time)
+    peak_mbps: float = 0.0
 
 
 # ── Detector ──────────────────────────────────────────────────────────────────
@@ -89,6 +98,9 @@ class Detector:
         """
         Called every time the Monitor reports a high-I/O process.
         Manages state transitions: NORMAL → SUSPICIOUS → UNDER_INVESTIGATION
+
+        Also checks for extreme I/O (3x threshold) which triggers
+        an immediate kill — no legitimate process should write that fast.
         """
         # Ignore whitelisted processes entirely
         if self.is_whitelisted(alert.name):
@@ -116,13 +128,35 @@ class Detector:
             proc = self.tracked[alert.pid]
             proc.last_alert = time.time()
 
-            # ── NORMAL → SUSPICIOUS ───────────────────────────────────────
+            # Track peak I/O
+            if alert.write_mbps > proc.peak_mbps:
+                proc.peak_mbps = alert.write_mbps
+
+            # ── EXTREME I/O CHECK ─────────────────────────────────────
+            # If a process is writing at 3x the threshold and has been
+            # suspicious for the full duration, kill it immediately.
+            # No legitimate process (outside the whitelist) writes 150+ MB/s.
+            if (alert.write_mbps >= EXTREME_IO_MBPS
+                    and proc.state in (State.SUSPICIOUS, State.UNDER_INVESTIGATION)):
+                elapsed = time.time() - proc.state_since
+                if elapsed >= SUSPICIOUS_DURATION_SEC:
+                    log.critical(
+                        f"EXTREME I/O KILL: PID {alert.pid} ({alert.name}) "
+                        f"writing at {alert.write_mbps:.1f} MB/s "
+                        f"({EXTREME_IO_MULTIPLIER:.0f}x threshold) for {elapsed:.0f}s"
+                    )
+                    self._kill_process(alert.pid)
+                    proc.state = State.KILLED
+                    return
+
+            # ── NORMAL → SUSPICIOUS ───────────────────────────────────
             if proc.state == State.NORMAL:
                 proc.state = State.SUSPICIOUS
                 proc.state_since = time.time()
-                log.info(f"PID {alert.pid} ({alert.name}) → SUSPICIOUS")
+                log.info(f"PID {alert.pid} ({alert.name}) → SUSPICIOUS "
+                         f"({alert.write_mbps:.1f} MB/s)")
 
-            # ── SUSPICIOUS → UNDER_INVESTIGATION ─────────────────────────
+            # ── SUSPICIOUS → UNDER_INVESTIGATION ─────────────────────
             elif proc.state == State.SUSPICIOUS:
                 elapsed = time.time() - proc.state_since
                 log.info(f"PID {alert.pid} suspicious for {elapsed:.0f}s "
@@ -134,9 +168,10 @@ class Detector:
                     log.warning(f"PID {alert.pid} ({alert.name}) → UNDER_INVESTIGATION")
                     self._escalate(proc)
 
-            # ── Already under investigation — just wait for verdict ────────
+            # ── Already under investigation — just wait for verdict ────
             elif proc.state == State.UNDER_INVESTIGATION:
-                log.info(f"PID {alert.pid} still under investigation...")
+                log.info(f"PID {alert.pid} still under investigation "
+                         f"({alert.write_mbps:.1f} MB/s)...")
 
     def handle_verdict(self, pid: int, is_ransomware: bool):
         """
@@ -151,7 +186,7 @@ class Detector:
             proc = self.tracked[pid]
 
             if is_ransomware:
-                log.critical(f"RANSOMWARE DETECTED — Killing PID {pid} ({proc.name})")
+                log.critical(f"HONEYPOT CONFIRMED — Killing PID {pid} ({proc.name})")
                 self._kill_process(pid)
                 proc.state = State.KILLED
 
@@ -195,9 +230,8 @@ class Detector:
         """Send SIGKILL to a process. Cross-platform safe."""
         try:
             if sys.platform == "win32":
-                # Windows: use taskkill. PID is trusted internal value from /proc
-                # nosec: pid is from internal tracking, not user input
-                os.system(f"taskkill /F /PID {pid}")  # nosec
+                # PID is from internal /proc tracking, not user input
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)], check=False)
             else:
                 os.kill(pid, signal.SIGKILL)
             log.critical(f"PID {pid} killed.")
