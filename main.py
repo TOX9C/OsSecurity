@@ -37,25 +37,50 @@ except ImportError:
 
 # ── Logging Setup ─────────────────────────────────────────────────────────────
 def setup_logging(verbose: bool = False):
-    """Configure logging for all components."""
+    """Configure logging for all components.
+    
+    Logs go to:
+    - Console (stdout) — for real-time monitoring
+    - Log file (logs/detection_YYYY-MM-DD_HH-MM-SS.log) — for post-incident review
+    """
+    import os
+    from datetime import datetime
+
     level = logging.DEBUG if verbose else logging.INFO
 
-    formatter = logging.Formatter(
+    # Console handler — short timestamp for readability
+    console_formatter = logging.Formatter(
         fmt="%(asctime)s [%(name)s] %(message)s",
         datefmt="%H:%M:%S"
     )
-
     console = logging.StreamHandler()
-    console.setFormatter(formatter)
+    console.setFormatter(console_formatter)
     console.setLevel(level)
 
+    # File handler — full timestamp + level for detailed review
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_file = os.path.join(log_dir, f"detection_{timestamp}.log")
+
+    file_formatter = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)-8s] [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(file_formatter)
+    file_handler.setLevel(logging.DEBUG)  # Always log everything to file
+
     root = logging.getLogger()
-    root.setLevel(level)
+    root.setLevel(logging.DEBUG)  # Let handlers decide what to show
     root.addHandler(console)
+    root.addHandler(file_handler)
 
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-    return logging.getLogger("Main")
+    main_log = logging.getLogger("Main")
+    main_log.info(f"Log file: {log_file}")
+    return main_log
 
 
 # ── Platform Check ────────────────────────────────────────────────────────────

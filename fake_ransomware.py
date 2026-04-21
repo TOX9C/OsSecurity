@@ -318,6 +318,119 @@ def cleanup_files() -> None:
     print("[CLEANUP] Done.")
 
 
+def report_damage() -> None:
+    """
+    Scan all target directories and report how many files were encrypted
+    vs how many survived. Shows per-directory and overall stats with
+    percentages so you can evaluate how effective the detection was.
+    """
+    print("\n" + "=" * 60)
+    print("  DAMAGE REPORT — Post-Attack Assessment")
+    print("=" * 60)
+
+    total_survived = 0
+    total_encrypted = 0
+    total_original = 0
+    dir_reports = []
+
+    # Scan each user directory
+    for scan_dir in SCAN_DIRS:
+        if not scan_dir.is_dir():
+            continue
+
+        survived = 0
+        encrypted = 0
+
+        for f in scan_dir.rglob("*"):
+            if not f.is_file():
+                continue
+            # Skip ransom notes and honeypot metadata
+            if f.name == "README_DECRYPT_YOUR_FILES.txt":
+                continue
+
+            if f.name.endswith(".encrypted"):
+                encrypted += 1
+            else:
+                survived += 1
+
+        original = survived + encrypted
+        if original > 0:
+            dir_reports.append((scan_dir, survived, encrypted, original))
+            total_survived += survived
+            total_encrypted += encrypted
+            total_original += original
+
+    # Scan /tmp victims
+    if VICTIM_ROOT.is_dir():
+        survived = 0
+        encrypted = 0
+        for f in VICTIM_ROOT.rglob("*"):
+            if not f.is_file():
+                continue
+            if f.name.endswith(".encrypted"):
+                encrypted += 1
+            else:
+                survived += 1
+        original = survived + encrypted
+        if original > 0:
+            dir_reports.append((VICTIM_ROOT, survived, encrypted, original))
+            total_survived += survived
+            total_encrypted += encrypted
+            total_original += original
+
+    if total_original == 0:
+        print("\n  No files found. Run 'create' first, then 'encrypt'.")
+        print("=" * 60)
+        return
+
+    # Per-directory breakdown
+    print(f"\n{'Directory':<40} {'Survived':>10} {'Encrypted':>10} {'Total':>8} {'Damage':>8}")
+    print("-" * 80)
+
+    for scan_dir, survived, encrypted, original in dir_reports:
+        # Shorten path for display
+        try:
+            display_path = str(scan_dir.relative_to(Path.home()))
+            display_path = "~/" + display_path
+        except ValueError:
+            display_path = str(scan_dir)
+
+        if len(display_path) > 38:
+            display_path = "..." + display_path[-35:]
+
+        pct = (encrypted / original * 100) if original > 0 else 0
+        print(f"  {display_path:<38} {survived:>8}   {encrypted:>8}   {original:>6}   {pct:>5.1f}%")
+
+    # Overall summary
+    total_pct = (total_encrypted / total_original * 100) if total_original > 0 else 0
+    saved_pct = (total_survived / total_original * 100) if total_original > 0 else 0
+
+    print("-" * 80)
+    print(f"  {'TOTAL':<38} {total_survived:>8}   {total_encrypted:>8}   {total_original:>6}   {total_pct:>5.1f}%")
+
+    print("\n" + "=" * 60)
+    print(f"  Files created (total):      {total_original}")
+    print(f"  Files encrypted (damaged):  {total_encrypted}  ({total_pct:.1f}%)")
+    print(f"  Files survived (saved):     {total_survived}  ({saved_pct:.1f}%)")
+    print("=" * 60)
+
+    # Verdict
+    if total_encrypted == 0:
+        print("\n  ✅ PERFECT — No files were encrypted!")
+        print("  The detection system stopped the ransomware before any damage.")
+    elif total_pct < 10:
+        print(f"\n  ✅ GOOD — Only {total_pct:.1f}% of files encrypted.")
+        print("  Detection kicked in fast and limited the damage.")
+    elif total_pct < 50:
+        print(f"\n  ⚠️  PARTIAL — {total_pct:.1f}% of files encrypted.")
+        print("  Detection worked but was too slow to prevent significant damage.")
+    else:
+        print(f"\n  ❌ FAILED — {total_pct:.1f}% of files encrypted.")
+        print("  Detection did not stop the ransomware in time.")
+
+    print()
+
+
 def main():
     if sys.platform != "linux":
         print("[ERROR] This script requires Linux (/proc filesystem).")
@@ -331,14 +444,15 @@ How to use:
   Terminal 1:  sudo python3 main.py                    # Start detection
   Terminal 2:  python3 fake_ransomware.py create        # Set up fake files
   Terminal 3:  python3 fake_ransomware.py encrypt       # Run attack
+  Terminal 3:  python3 fake_ransomware.py report        # See damage stats
   Terminal 3:  python3 fake_ransomware.py cleanup       # Clean up after
 """
     )
 
     parser.add_argument(
         "action",
-        choices=["create", "encrypt", "cleanup", "all"],
-        help="Action: create files, encrypt them, clean up, or run all sequentially"
+        choices=["create", "encrypt", "report", "cleanup", "all"],
+        help="Action: create files, encrypt them, report damage, clean up, or run all"
     )
     parser.add_argument(
         "--duration",
@@ -359,6 +473,11 @@ How to use:
 
     elif args.action == "encrypt":
         encrypt_files(args.duration)
+        # Auto-show damage report after encryption
+        report_damage()
+
+    elif args.action == "report":
+        report_damage()
 
     elif args.action == "cleanup":
         cleanup_files()
@@ -368,6 +487,7 @@ How to use:
         print("\n[PAUSE] Files created. Starting encryption in 3 seconds...")
         time.sleep(3)
         encrypt_files(args.duration)
+        report_damage()
         print("\n[PAUSE] Attack done. Cleaning up in 5 seconds...")
         time.sleep(5)
         cleanup_files()
