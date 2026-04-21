@@ -21,7 +21,7 @@ import queue
 import logging
 import argparse
 
-from config import IO_THRESHOLD_MBPS, SUSPICIOUS_DURATION_SEC, HONEYPOT_WATCH_SEC
+from config import IO_THRESHOLD_MBPS, SUSPICIOUS_DURATION_SEC, HONEYPOT_WATCH_SEC, MONITOR_INTERVAL
 from monitor import Monitor
 from detector import Detector
 from honeypot import Honeypot
@@ -130,7 +130,7 @@ Examples:
     log.info("=" * 60)
 
     # Monitor: watches /proc for high I/O
-    monitor = Monitor(alert_queue, interval=1.0)
+    monitor = Monitor(alert_queue, interval=MONITOR_INTERVAL)
     log.info("Monitor initialized")
 
     # Rate limiter: throttles suspicious processes to 1 MB/s via cgroups
@@ -161,6 +161,7 @@ Examples:
     # Print configuration
     log.info("-" * 40)
     log.info(f"I/O Threshold: {IO_THRESHOLD_MBPS} MB/s")
+    log.info(f"Monitor Interval: {MONITOR_INTERVAL}s")
     log.info(f"Suspicious Duration: {SUSPICIOUS_DURATION_SEC} seconds")
     log.info(f"Honeypot Watch: {HONEYPOT_WATCH_SEC} seconds")
     log.info(f"Rate Limiting: {'enabled' if rate_limiter else 'disabled'}")

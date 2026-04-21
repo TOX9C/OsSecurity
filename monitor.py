@@ -5,11 +5,8 @@ import threading
 import logging
 from dataclasses import dataclass, field
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [Monitor] %(message)s",
-    datefmt="%H:%M:%S"
-)
+from config import IO_THRESHOLD_MBPS
+
 log = logging.getLogger("Monitor")
 
 
@@ -23,11 +20,14 @@ class IOAlert:
 
 
 class Monitor:
-    def __init__(self, alert_queue: queue.Queue, interval: float = 1.0):
+    def __init__(self, alert_queue: queue.Queue, interval: float = 0.25,
+                 threshold_mbps: float | None = None):
         self.alert_queue = alert_queue
         self.interval = interval
+        self.threshold_mbps = threshold_mbps if threshold_mbps is not None else IO_THRESHOLD_MBPS
         self._running = False
         self._last_readings: dict[str, int] = {}
+        self._last_poll_time: float = 0.0
 
     def start(self):
         self._running = True
@@ -61,7 +61,22 @@ class Monitor:
             return None
 
     def _run(self):
+        self._last_poll_time = time.time()
+        # First pass: just collect baseline readings
+        for pid_str in self._get_all_pids():
+            data = self._read_proc_io(pid_str)
+            if data:
+                self._last_readings[pid_str] = data.get('write_bytes', 0)
+        time.sleep(self.interval)
+
         while self._running:
+            now = time.time()
+            elapsed = now - self._last_poll_time
+            self._last_poll_time = now
+
+            if elapsed <= 0:
+                elapsed = self.interval  # fallback to avoid division by zero
+
             current_pids = self._get_all_pids()
             new_readings: dict[str, int] = {}
 
@@ -74,9 +89,12 @@ class Monitor:
 
                 if pid_str in self._last_readings:
                     bytes_diff = current_write - self._last_readings[pid_str]
-                    mb_ps = bytes_diff / (1024 * 1024)
+                    # Use actual elapsed time for accurate rate calculation
+                    mb_ps = bytes_diff / (1024 * 1024) / elapsed
 
-                    if mb_ps > 0:
+                    # Pre-filter: only send alerts for processes ABOVE threshold
+                    # This prevents queue flooding with irrelevant low-I/O alerts
+                    if mb_ps >= self.threshold_mbps:
                         name = self._get_process_name(pid_str)
                         alert = IOAlert(
                             pid=int(pid_str),
@@ -84,6 +102,7 @@ class Monitor:
                             write_mbps=mb_ps
                         )
                         self.alert_queue.put(alert)
+                        log.info(f"PID {pid_str} ({name}) → SUSPICIOUS ({mb_ps:.1f} MB/s)")
 
                 new_readings[pid_str] = current_write
 

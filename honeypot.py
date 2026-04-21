@@ -6,6 +6,8 @@ import threading
 from pathlib import Path
 from dataclasses import dataclass
 
+from detector import Verdict
+
 log = logging.getLogger("Honeypot")
 
 HONEYPOT_META_DIR = Path("/tmp/honeypot_meta")
@@ -16,13 +18,6 @@ class HoneypotFile:
     """Decoy file created to detect ransomware behavior."""
     path: Path
     content_hash: str
-
-
-@dataclass
-class Verdict:
-    """Message format from Honeypot → Detector."""
-    pid: int
-    is_ransomware: bool
 
 
 class Honeypot:

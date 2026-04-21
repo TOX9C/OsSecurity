@@ -24,7 +24,6 @@ log = logging.getLogger("Detector")
 # ── State machine ─────────────────────────────────────────────────────────────
 class State(Enum):
     NORMAL = "normal"
-    SUSPICIOUS = "suspicious"
     THROTTLED = "throttled"          # rate-limited + honeypot deployed
     KILLED = "killed"
     CLEARED = "cleared"
@@ -92,35 +91,35 @@ class Detector:
         """
         Called every time the Monitor reports a high-I/O process.
 
-        Pipeline:
-          1. NORMAL → SUSPICIOUS  (first time we see high I/O)
-          2. SUSPICIOUS → THROTTLED  (sustained high I/O)
+        Pipeline (throttle-first approach):
+          1. NORMAL → THROTTLED  (immediately on first detection above threshold)
              - Throttle process to 1 MB/s via cgroups
              - Deploy honeypot files
-          3. THROTTLED → KILLED  (honeypot says ransomware)
+          2. THROTTLED → KILLED  (honeypot confirms ransomware)
              or THROTTLED → CLEARED  (honeypot says clean → release throttle)
         """
         # Ignore whitelisted processes entirely
         if self.is_whitelisted(alert.name):
             return
 
-        # Ignore alerts below threshold
+        # Ignore alerts below threshold (monitor pre-filters, but double-check)
         if alert.write_mbps < IO_THRESHOLD_MBPS:
-            with self._lock:
-                if alert.pid in self.tracked:
-                    proc = self.tracked[alert.pid]
-                    if proc.state == State.SUSPICIOUS:
-                        log.info(f"PID {alert.pid} ({alert.name}) I/O normalized — resetting to NORMAL")
-                        proc.state = State.NORMAL
-                        proc.state_since = time.time()
             return
 
         with self._lock:
-            # First time seeing this process
+            # First time seeing this process — create entry and IMMEDIATELY throttle
             if alert.pid not in self.tracked:
-                self.tracked[alert.pid] = TrackedProcess(pid=alert.pid, name=alert.name)
+                proc = TrackedProcess(pid=alert.pid, name=alert.name)
+                self.tracked[alert.pid] = proc
                 log.info(f"New suspicious process: PID {alert.pid} ({alert.name}) "
                          f"writing at {alert.write_mbps:.1f} MB/s")
+
+                # IMMEDIATE THROTTLE — don't wait for sustained activity
+                proc.state = State.THROTTLED
+                proc.state_since = time.time()
+                log.warning(f"PID {alert.pid} ({alert.name}) → THROTTLED "
+                            f"(immediate, {alert.write_mbps:.1f} MB/s)")
+                self._escalate(proc)
 
             proc = self.tracked[alert.pid]
             proc.last_alert = time.time()
@@ -128,26 +127,15 @@ class Detector:
             if alert.write_mbps > proc.peak_mbps:
                 proc.peak_mbps = alert.write_mbps
 
-            # ── NORMAL → SUSPICIOUS ───────────────────────────────────
+            # If somehow back to NORMAL (after being cleared), re-throttle on new spike
             if proc.state == State.NORMAL:
-                proc.state = State.SUSPICIOUS
+                proc.state = State.THROTTLED
                 proc.state_since = time.time()
-                log.info(f"PID {alert.pid} ({alert.name}) → SUSPICIOUS "
-                         f"({alert.write_mbps:.1f} MB/s)")
+                log.warning(f"PID {alert.pid} ({alert.name}) → THROTTLED "
+                            f"(re-detected, {alert.write_mbps:.1f} MB/s)")
+                self._escalate(proc)
 
-            # ── SUSPICIOUS → THROTTLED ────────────────────────────────
-            elif proc.state == State.SUSPICIOUS:
-                elapsed = time.time() - proc.state_since
-                log.info(f"PID {alert.pid} suspicious for {elapsed:.0f}s "
-                         f"(threshold: {SUSPICIOUS_DURATION_SEC}s)")
-
-                if elapsed >= SUSPICIOUS_DURATION_SEC:
-                    proc.state = State.THROTTLED
-                    proc.state_since = time.time()
-                    log.warning(f"PID {alert.pid} ({alert.name}) → THROTTLED")
-                    self._escalate(proc)
-
-            # ── Already throttled — waiting for honeypot verdict ──────
+            # Already throttled — waiting for honeypot verdict
             elif proc.state == State.THROTTLED:
                 log.info(f"PID {alert.pid} still throttled, waiting for honeypot verdict "
                          f"({alert.write_mbps:.1f} MB/s)...")
@@ -224,21 +212,30 @@ class Detector:
     def _run(self):
         """Main detector loop — reads from both queues."""
         while self._running:
-            # Check for new alerts
-            try:
-                alert = self.alert_queue.get(timeout=0.5)
-                if isinstance(alert, IOAlert):
-                    self.handle_alert(alert)
-            except queue.Empty:
-                pass
+            # Drain ALL pending alerts from the queue (batch processing)
+            # This prevents a single critical alert from being delayed
+            # behind dozens of low-priority alerts.
+            alerts_processed = 0
+            while True:
+                try:
+                    alert = self.alert_queue.get_nowait()
+                    if isinstance(alert, IOAlert):
+                        self.handle_alert(alert)
+                        alerts_processed += 1
+                except queue.Empty:
+                    break
 
             # Check for verdicts from honeypot
-            try:
-                verdict = self.verdict_queue.get_nowait()
-                if isinstance(verdict, Verdict):
-                    self.handle_verdict(verdict.pid, verdict.is_ransomware)
-            except queue.Empty:
-                pass
+            while True:
+                try:
+                    verdict = self.verdict_queue.get_nowait()
+                    if isinstance(verdict, Verdict):
+                        self.handle_verdict(verdict.pid, verdict.is_ransomware)
+                except queue.Empty:
+                    break
 
             # Cleanup stale processes
             self.check_stale_processes()
+
+            # Short sleep to avoid busy-waiting, but fast enough to react quickly
+            time.sleep(0.1)
