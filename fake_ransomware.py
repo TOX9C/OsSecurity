@@ -47,7 +47,12 @@ FILE_EXTENSIONS = [
 
 
 def create_victim_files() -> list[Path]:
-    """Create realistic file structures in user directories."""
+    """Create realistic file structures in user directories.
+    
+    Writes files with small delays between them to stay under the
+    I/O detection threshold (20 MB/s). Without this, the create
+    command itself gets flagged and killed as ransomware.
+    """
     all_files = []
 
     for scan_dir in SCAN_DIRS:
@@ -78,12 +83,14 @@ def create_victim_files() -> list[Path]:
                     file_path.write_text(content)
 
                 all_files.append(file_path)
+                time.sleep(0.05)  # Stay under detection threshold
 
         for i in range(5):
             ext = FILE_EXTENSIONS[i % len(FILE_EXTENSIONS)]
             file_path = victim_dir / f"important_{i:03d}{ext}"
             file_path.write_text(f"Top-level document {i}\n" + "A" * 500 + "\n")
             all_files.append(file_path)
+            time.sleep(0.05)
 
     VICTIM_ROOT.mkdir(parents=True, exist_ok=True)
     for i in range(20):
@@ -91,6 +98,7 @@ def create_victim_files() -> list[Path]:
         file_path = VICTIM_ROOT / f"file_{i:03d}{ext}"
         file_path.write_bytes(os.urandom(100 * 1024))
         all_files.append(file_path)
+        time.sleep(0.05)
 
     print(f"[CREATE] Created {len(all_files)} files")
     return all_files
