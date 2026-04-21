@@ -1,43 +1,160 @@
+"""
+Rate Limiter — throttles process I/O via cgroups v2.
+
+When a suspicious process is detected, we:
+1. Create a cgroup: /sys/fs/cgroup/throttle_jail/
+2. Set I/O limits: 1 MB/s read, 1 MB/s write
+3. Move the process PID into that cgroup
+
+When cleared:
+1. Move PID back to root cgroup
+2. Remove the throttle_jail cgroup
+
+Requires: Linux + cgroups v2 + root/sudo
+"""
+
 import os
 import subprocess
+import logging
 
-group_path = "/sys/fs/cgroup/throttle_jail"
+log = logging.getLogger("RateLimiter")
 
-def get_drives_major_minor():
-    result = subprocess.check_output(["lsblk", "-no", "NAME,MAJ:MIN"], text=True).splitlines()
-    drives = []
-    for line in result[1:]:
-        parts = line.split()
-        if len(parts) == 2 and ':' in parts[1]:
-            drives.append(parts[1])
-    return drives
+CGROUP_ROOT = "/sys/fs/cgroup"
+CGROUP_JAIL = f"{CGROUP_ROOT}/throttle_jail"
 
-def setup_cgroup():
-    if os.path.isdir(group_path):
-        return True
-    os.mkdir(group_path)
-    subprocess.run('echo "+io" | sudo tee /sys/fs/cgroup/cgroup.subtree_control', shell=True)
-    return os.path.exists(f"{group_path}/io.max")
+# 1 MB/s = 1048576 bytes/s (cgroups uses bytes per second)
+# "max" means no limit; we set rbps/wbps to 1048576
+THROTTLE_READ_BPS = "1048576"    # 1 MB/s
+THROTTLE_WRITE_BPS = "1048576"   # 1 MB/s
 
-def throttle(pid: int):
-    if setup_cgroup():
-        drives = get_drives_major_minor()
-        for drive in drives:
-            subprocess.run(f"echo '{drive} wbps=1 rbps=1' | sudo tee {group_path}/io.max", shell=True)
-        subprocess.run(f"echo {pid} | sudo tee {group_path}/cgroup.procs", shell=True)
-        print(f"[RateLimiting]: PID {pid} is rate limited on {drives}...")
 
-def release(pid: int):
-    subprocess.run(f"echo {pid} | sudo tee /sys/fs/cgroup/cgroup.procs", shell=True)
-    print(f"[RateLimiting]: PID {pid} released")
-
-def cleanup():
+def get_drives_major_minor() -> list[str]:
+    """Get major:minor pairs for all block devices."""
     try:
-        with open(f"{group_path}/cgroup.procs", 'r') as file:
-            pids = [line.strip() for line in file if line.strip()]
-        for pid in pids:
-            subprocess.run(f"echo {pid} | sudo tee /sys/fs/cgroup/cgroup.procs", shell=True)
-        os.rmdir(group_path)
-        print("Cleanup complete")
-    except Exception as e:
-        print(f"Cleanup failed: {e}")
+        result = subprocess.run(
+            ["lsblk", "-no", "MAJ:MIN"],
+            capture_output=True, text=True, check=True
+        )
+        drives = []
+        for line in result.stdout.strip().splitlines():
+            line = line.strip()
+            if ":" in line and line != "MAJ:MIN":
+                drives.append(line)
+        return drives
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        log.warning(f"Could not list drives with lsblk: {e}")
+        return []
+
+
+def _write_cgroup_file(path: str, value: str) -> bool:
+    """Write a value to a cgroup control file."""
+    try:
+        with open(path, 'w') as f:
+            f.write(value)
+        return True
+    except (PermissionError, FileNotFoundError, OSError) as e:
+        log.error(f"Failed to write '{value}' to {path}: {e}")
+        return False
+
+
+def _read_cgroup_file(path: str) -> str | None:
+    """Read a value from a cgroup control file."""
+    try:
+        with open(path, 'r') as f:
+            return f.read().strip()
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def setup_cgroup() -> bool:
+    """Create the throttle_jail cgroup. Returns True if ready."""
+    if os.path.isdir(CGROUP_JAIL) and os.path.isfile(f"{CGROUP_JAIL}/io.max"):
+        return True
+
+    # Enable io controller in the root cgroup subtree
+    _write_cgroup_file(f"{CGROUP_ROOT}/cgroup.subtree_control", "+io")
+
+    # Create the child cgroup
+    try:
+        os.mkdir(CGROUP_JAIL)
+    except FileExistsError:
+        pass
+    except PermissionError as e:
+        log.error(f"Cannot create cgroup (need root): {e}")
+        return False
+
+    # Verify it exists
+    if not os.path.isfile(f"{CGROUP_JAIL}/io.max"):
+        log.error("cgroup io.max not found after creation — cgroups v2 may not be available")
+        return False
+
+    # Enable io controller in the jail cgroup too
+    _write_cgroup_file(f"{CGROUP_JAIL}/cgroup.subtree_control", "+io")
+
+    log.info(f"cgroup jail created: {CGROUP_JAIL}")
+    return True
+
+
+def throttle(pid: int) -> bool:
+    """
+    Throttle a process to 1 MB/s read/write by moving it into
+    the throttle_jail cgroup with I/O limits.
+    """
+    if not setup_cgroup():
+        log.error("Cannot throttle — cgroup setup failed")
+        return False
+
+    drives = get_drives_major_minor()
+    if not drives:
+        # Fallback: use "default" which applies to all devices
+        drives = ["*"]
+
+    # Set I/O limits on all drives
+    for drive in drives:
+        # Format: "MAJ:MIN rbps=VALUE wbps=VALUE"
+        limit_str = f"{drive} rbps={THROTTLE_READ_BPS} wbps={THROTTLE_WRITE_BPS}"
+        if not _write_cgroup_file(f"{CGROUP_JAIL}/io.max", limit_str):
+            log.warning(f"Failed to set I/O limit for drive {drive}")
+
+    # Move the process into the jail cgroup
+    pid_str = str(pid)
+    if _write_cgroup_file(f"{CGROUP_JAIL}/cgroup.procs", pid_str):
+        log.info(f"PID {pid} throttled to 1 MB/s in cgroup jail")
+        return True
+    else:
+        log.error(f"Failed to move PID {pid} into cgroup jail")
+        return False
+
+
+def release(pid: int) -> bool:
+    """Move a process back to the root cgroup (remove throttle)."""
+    pid_str = str(pid)
+    if _write_cgroup_file(f"{CGROUP_ROOT}/cgroup.procs", pid_str):
+        log.info(f"PID {pid} released from cgroup jail")
+        return True
+    else:
+        log.error(f"Failed to release PID {pid} from cgroup jail")
+        return False
+
+
+def cleanup() -> None:
+    """Move all jailed processes back to root and remove the jail cgroup."""
+    procs_content = _read_cgroup_file(f"{CGROUP_JAIL}/cgroup.procs")
+    if procs_content:
+        for pid_str in procs_content.splitlines():
+            pid_str = pid_str.strip()
+            if pid_str:
+                _write_cgroup_file(f"{CGROUP_ROOT}/cgroup.procs", pid_str)
+                log.info(f"Released PID {pid_str} during cleanup")
+
+    # Remove I/O limits
+    drives = get_drives_major_minor()
+    for drive in drives or ["*"]:
+        _write_cgroup_file(f"{CGROUP_JAIL}/io.max", f"{drive} rbps=max wbps=max")
+
+    # Remove the cgroup directory
+    try:
+        os.rmdir(CGROUP_JAIL)
+        log.info("cgroup jail removed")
+    except OSError as e:
+        log.warning(f"Could not remove cgroup jail: {e}")

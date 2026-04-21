@@ -4,12 +4,13 @@ Ransomware Detection System - Main Entry Point
 
 This system monitors process I/O activity and detects potential ransomware
 by watching for suspicious write patterns. When detected, it:
-1. Throttles the suspicious process using cgroups
-2. Deploys honeypot files to verify ransomware behavior
-3. Kills confirmed ransomware processes
+1. Throttles the suspicious process to 1 MB/s using cgroups
+2. Deploys honeypot files in user directories to verify ransomware behavior
+3. Kills confirmed ransomware processes (honeypot files modified)
+4. Releases throttle for cleared processes (honeypot files untouched)
 
 Usage:
-    sudo python3 main.py
+  sudo python3 main.py
 
 Note: Requires root/sudo for cgroup operations and process termination.
 """
@@ -27,8 +28,7 @@ from honeypot import Honeypot
 
 # Try to import rate limiter (requires Linux + cgroups v2)
 try:
-    import importlib
-    importlib.import_module("ratelimiter")
+    import ratelimiter as rate_limiter_module
     RATE_LIMITER_AVAILABLE = True
 except ImportError:
     RATE_LIMITER_AVAILABLE = False
@@ -40,23 +40,19 @@ def setup_logging(verbose: bool = False):
     """Configure logging for all components."""
     level = logging.DEBUG if verbose else logging.INFO
 
-    # Create formatter
     formatter = logging.Formatter(
         fmt="%(asctime)s [%(name)s] %(message)s",
         datefmt="%H:%M:%S"
     )
 
-    # Console handler
     console = logging.StreamHandler()
     console.setFormatter(formatter)
     console.setLevel(level)
 
-    # Configure root logger
     root = logging.getLogger()
     root.setLevel(level)
     root.addHandler(console)
 
-    # Reduce noise from other libraries
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
     return logging.getLogger("Main")
@@ -70,7 +66,6 @@ def check_platform():
         print("The monitor uses /proc filesystem which is Linux-specific.")
         sys.exit(1)
 
-    # Check for /proc directory
     import os
     if not os.path.isdir("/proc"):
         print("Error: /proc filesystem not found.")
@@ -83,9 +78,9 @@ def check_permissions():
     import os
     if os.geteuid() != 0:
         print("\n[Warning] Not running as root.")
-        print("  - Process monitoring will work")
-        print("  - Rate limiting requires root (cgroups)")
-        print("  - Killing processes requires root or same user\n")
+        print(" - Process monitoring will work")
+        print(" - Rate limiting requires root (cgroups)")
+        print(" - Killing processes requires root or same user\n")
         return False
     return True
 
@@ -97,10 +92,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    sudo python3 main.py              # Start with default settings
-    sudo python3 main.py --verbose    # Enable debug logging
-    sudo python3 main.py --no-throttle  # Disable rate limiting
-        """
+  sudo python3 main.py              # Start with default settings
+  sudo python3 main.py --verbose    # Enable debug logging
+  sudo python3 main.py --no-throttle  # Disable rate limiting
+"""
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -138,16 +133,15 @@ Examples:
     monitor = Monitor(alert_queue, interval=1.0)
     log.info("Monitor initialized")
 
-    # Rate limiter: throttles suspicious processes
+    # Rate limiter: throttles suspicious processes to 1 MB/s via cgroups
     rate_limiter = None
     if not args.no_throttle and RATE_LIMITER_AVAILABLE and has_root:
-        import ratelimiter as rl_module
-        rate_limiter = rl_module  # ratelimiter module exports throttle(pid)/release(pid)
+        rate_limiter = rate_limiter_module
         log.info("Rate limiter initialized (cgroups v2)")
     else:
         log.info("Rate limiter disabled or unavailable")
 
-    # Honeypot: creates decoy files to verify ransomware
+    # Honeypot: creates decoy files in user directories to verify ransomware
     honeypot = None
     if not args.no_honeypot:
         honeypot = Honeypot(verdict_queue, watch_duration=HONEYPOT_WATCH_SEC)
@@ -168,6 +162,7 @@ Examples:
     log.info("-" * 40)
     log.info(f"I/O Threshold: {IO_THRESHOLD_MBPS} MB/s")
     log.info(f"Suspicious Duration: {SUSPICIOUS_DURATION_SEC} seconds")
+    log.info(f"Honeypot Watch: {HONEYPOT_WATCH_SEC} seconds")
     log.info(f"Rate Limiting: {'enabled' if rate_limiter else 'disabled'}")
     log.info(f"Honeypot: {'enabled' if honeypot else 'disabled'}")
     log.info("-" * 40)

@@ -20,18 +20,12 @@ from config import (
 # ── Logging ───────────────────────────────────────────────────────────────────
 log = logging.getLogger("Detector")
 
-# If a process writes above this multiplier of the threshold,
-# it's considered "extreme I/O" and killed immediately without
-# waiting for honeypot confirmation — no legitimate process
-# (outside the whitelist) should be writing this fast.
-EXTREME_IO_MULTIPLIER = 3.0
-EXTREME_IO_MBPS = IO_THRESHOLD_MBPS * EXTREME_IO_MULTIPLIER
 
 # ── State machine ─────────────────────────────────────────────────────────────
 class State(Enum):
     NORMAL = "normal"
     SUSPICIOUS = "suspicious"
-    UNDER_INVESTIGATION = "under_investigation"
+    THROTTLED = "throttled"          # rate-limited + honeypot deployed
     KILLED = "killed"
     CLEARED = "cleared"
 
@@ -60,10 +54,10 @@ class Detector:
     def __init__(self, alert_queue: queue.Queue, verdict_queue: queue.Queue,
                  rate_limiter=None, honeypot=None):
         """
-        alert_queue — Monitor puts IOAlert objects here
+        alert_queue  — Monitor puts IOAlert objects here
         verdict_queue — Honeypot puts Verdict objects here
         rate_limiter — object with .throttle(pid) and .release(pid)
-        honeypot — object with .deploy_for_process(pid)
+        honeypot     — object with .deploy_for_process(pid)
         """
         self.alert_queue = alert_queue
         self.verdict_queue = verdict_queue
@@ -97,10 +91,14 @@ class Detector:
     def handle_alert(self, alert: IOAlert):
         """
         Called every time the Monitor reports a high-I/O process.
-        Manages state transitions: NORMAL → SUSPICIOUS → UNDER_INVESTIGATION
 
-        Also checks for extreme I/O (3x threshold) which triggers
-        an immediate kill — no legitimate process should write that fast.
+        Pipeline:
+          1. NORMAL → SUSPICIOUS  (first time we see high I/O)
+          2. SUSPICIOUS → THROTTLED  (sustained high I/O)
+             - Throttle process to 1 MB/s via cgroups
+             - Deploy honeypot files
+          3. THROTTLED → KILLED  (honeypot says ransomware)
+             or THROTTLED → CLEARED  (honeypot says clean → release throttle)
         """
         # Ignore whitelisted processes entirely
         if self.is_whitelisted(alert.name):
@@ -108,7 +106,6 @@ class Detector:
 
         # Ignore alerts below threshold
         if alert.write_mbps < IO_THRESHOLD_MBPS:
-            # If we were tracking this process, it calmed down — reset it
             with self._lock:
                 if alert.pid in self.tracked:
                     proc = self.tracked[alert.pid]
@@ -128,26 +125,8 @@ class Detector:
             proc = self.tracked[alert.pid]
             proc.last_alert = time.time()
 
-            # Track peak I/O
             if alert.write_mbps > proc.peak_mbps:
                 proc.peak_mbps = alert.write_mbps
-
-            # ── EXTREME I/O CHECK ─────────────────────────────────────
-            # If a process is writing at 3x the threshold and has been
-            # suspicious for the full duration, kill it immediately.
-            # No legitimate process (outside the whitelist) writes 150+ MB/s.
-            if (alert.write_mbps >= EXTREME_IO_MBPS
-                    and proc.state in (State.SUSPICIOUS, State.UNDER_INVESTIGATION)):
-                elapsed = time.time() - proc.state_since
-                if elapsed >= SUSPICIOUS_DURATION_SEC:
-                    log.critical(
-                        f"EXTREME I/O KILL: PID {alert.pid} ({alert.name}) "
-                        f"writing at {alert.write_mbps:.1f} MB/s "
-                        f"({EXTREME_IO_MULTIPLIER:.0f}x threshold) for {elapsed:.0f}s"
-                    )
-                    self._kill_process(alert.pid)
-                    proc.state = State.KILLED
-                    return
 
             # ── NORMAL → SUSPICIOUS ───────────────────────────────────
             if proc.state == State.NORMAL:
@@ -156,27 +135,27 @@ class Detector:
                 log.info(f"PID {alert.pid} ({alert.name}) → SUSPICIOUS "
                          f"({alert.write_mbps:.1f} MB/s)")
 
-            # ── SUSPICIOUS → UNDER_INVESTIGATION ─────────────────────
+            # ── SUSPICIOUS → THROTTLED ────────────────────────────────
             elif proc.state == State.SUSPICIOUS:
                 elapsed = time.time() - proc.state_since
                 log.info(f"PID {alert.pid} suspicious for {elapsed:.0f}s "
                          f"(threshold: {SUSPICIOUS_DURATION_SEC}s)")
 
                 if elapsed >= SUSPICIOUS_DURATION_SEC:
-                    proc.state = State.UNDER_INVESTIGATION
+                    proc.state = State.THROTTLED
                     proc.state_since = time.time()
-                    log.warning(f"PID {alert.pid} ({alert.name}) → UNDER_INVESTIGATION")
+                    log.warning(f"PID {alert.pid} ({alert.name}) → THROTTLED")
                     self._escalate(proc)
 
-            # ── Already under investigation — just wait for verdict ────
-            elif proc.state == State.UNDER_INVESTIGATION:
-                log.info(f"PID {alert.pid} still under investigation "
+            # ── Already throttled — waiting for honeypot verdict ──────
+            elif proc.state == State.THROTTLED:
+                log.info(f"PID {alert.pid} still throttled, waiting for honeypot verdict "
                          f"({alert.write_mbps:.1f} MB/s)...")
 
     def handle_verdict(self, pid: int, is_ransomware: bool):
         """
         Called when the Honeypot returns its verdict.
-        Kills the process or releases it.
+        KILL the process or RELEASE the throttle.
         """
         with self._lock:
             if pid not in self.tracked:
@@ -186,51 +165,53 @@ class Detector:
             proc = self.tracked[pid]
 
             if is_ransomware:
-                log.critical(f"HONEYPOT CONFIRMED — Killing PID {pid} ({proc.name})")
+                log.critical(f"HONEYPOT CONFIRMED RANSOMWARE — Killing PID {pid} ({proc.name})")
                 self._kill_process(pid)
                 proc.state = State.KILLED
 
             else:
-                log.info(f"PID {pid} ({proc.name}) cleared — not ransomware")
+                log.info(f"PID {pid} ({proc.name}) CLEARED — not ransomware. Releasing throttle.")
                 if self.rate_limiter:
                     self.rate_limiter.release(pid)
                 proc.state = State.CLEARED
 
     def check_stale_processes(self):
-        """
-        Reset processes that stopped sending alerts back to NORMAL.
-        Call this periodically.
-        """
+        """Reset processes that stopped sending alerts back to NORMAL."""
         now = time.time()
         with self._lock:
             for pid, proc in list(self.tracked.items()):
                 if proc.state not in (State.NORMAL, State.KILLED, State.CLEARED):
                     if now - proc.last_alert > ALERT_EXPIRY_SEC:
                         log.info(f"PID {pid} ({proc.name}) went quiet — resetting to NORMAL")
+                        if proc.state == State.THROTTLED and self.rate_limiter:
+                            self.rate_limiter.release(pid)
                         proc.state = State.NORMAL
                         proc.state_since = now
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _escalate(self, proc: TrackedProcess):
-        """Throttle the process and deploy the honeypot."""
+        """Throttle the process AND deploy the honeypot."""
+        # Step 1: Throttle via cgroups to 1 MB/s
         if self.rate_limiter:
-            log.info(f"Throttling PID {proc.pid}")
+            log.info(f"Throttling PID {proc.pid} to 1 MB/s")
             self.rate_limiter.throttle(proc.pid)
         else:
-            log.info(f"[no rate limiter] Would throttle PID {proc.pid}")
+            log.warning(f"[no rate limiter] Cannot throttle PID {proc.pid} — "
+                        f"process will continue at full speed without cgroups!")
 
+        # Step 2: Deploy honeypot files
         if self.honeypot:
             log.info(f"Deploying honeypot for PID {proc.pid}")
             self.honeypot.deploy_for_process(proc.pid)
         else:
-            log.info(f"[no honeypot] Would deploy honeypot for PID {proc.pid}")
+            log.warning(f"[no honeypot] Cannot verify PID {proc.pid} — "
+                        f"no way to confirm or deny ransomware!")
 
     def _kill_process(self, pid: int):
-        """Send SIGKILL to a process. Cross-platform safe."""
+        """Send SIGKILL to a process."""
         try:
             if sys.platform == "win32":
-                # PID is from internal /proc tracking, not user input
                 subprocess.run(["taskkill", "/F", "/PID", str(pid)], check=False)
             else:
                 os.kill(pid, signal.SIGKILL)
@@ -238,7 +219,7 @@ class Detector:
         except ProcessLookupError:
             log.warning(f"PID {pid} already dead.")
         except PermissionError:
-            log.error(f"No permission to kill PID {pid}.")
+            log.error(f"No permission to kill PID {pid}. Run with sudo.")
 
     def _run(self):
         """Main detector loop — reads from both queues."""
