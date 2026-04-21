@@ -191,6 +191,14 @@ Examples:
             except Exception as e:
                 log.error(f"Rate limiter cleanup failed: {e}")
 
+        # Cleanup honeypot sentinel files
+        if honeypot:
+            try:
+                honeypot.cleanup_all()
+                log.info("Honeypot cleanup complete")
+            except Exception as e:
+                log.error(f"Honeypot cleanup failed: {e}")
+
         log.info("Shutdown complete. Goodbye.")
 
     except Exception as e:
