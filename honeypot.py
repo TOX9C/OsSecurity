@@ -45,17 +45,36 @@ class Honeypot:
 
     @staticmethod
     def _get_default_target_dirs() -> list[Path]:
-        """Find user directories that ransomware typically targets."""
-        home = Path.home()
-        candidates = [
-            home / "Desktop",
-            home / "Documents",
-            home / "Pictures",
-            home / "Downloads",
-            home / "Music",
-            home / "Videos",
-        ]
-        return [d for d in candidates if d.is_dir()]
+        """Find user directories that ransomware typically targets.
+        
+        When running as root (sudo), Path.home() returns /root which
+        typically has no Desktop/Documents/etc. We also scan /home/*
+        to find real user directories where files actually live.
+        """
+        subdirs = ["Desktop", "Documents", "Pictures", "Downloads", "Music", "Videos"]
+        homes_to_check = [Path.home()]
+
+        # When running as root, also scan all real user home directories
+        home_base = Path("/home")
+        if home_base.is_dir():
+            try:
+                for user_dir in home_base.iterdir():
+                    if user_dir.is_dir() and user_dir not in homes_to_check:
+                        homes_to_check.append(user_dir)
+            except PermissionError:
+                pass
+
+        candidates = []
+        for home in homes_to_check:
+            for sub in subdirs:
+                candidates.append(home / sub)
+
+        found = [d for d in candidates if d.is_dir()]
+        if found:
+            log.info(f"Found {len(found)} target directories for honeypot")
+        else:
+            log.warning("No target directories found for honeypot deployment")
+        return found
 
     def deploy_for_process(self, pid: int):
         """
