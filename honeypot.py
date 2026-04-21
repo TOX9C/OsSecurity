@@ -90,6 +90,24 @@ class Honeypot:
             log.warning("No target directories found for honeypot deployment")
         return found
 
+    @staticmethod
+    def _make_user_writable(file_path: Path):
+        """Make a honeypot file owned by the same user who owns its parent directory.
+        
+        When running as root (sudo), files we create are owned by root:root.
+        Ransomware running as a regular user (e.g., vboxuser) can't modify
+        root-owned files, so it silently skips them. By chowning the file
+        to match the parent directory's owner, the file looks like a normal
+        user file that ransomware can encrypt.
+        """
+        try:
+            parent_stat = file_path.parent.stat()
+            os.chown(file_path, parent_stat.st_uid, parent_stat.st_gid)
+            # Also ensure the file is writable by the owner
+            os.chmod(file_path, 0o644)
+        except (PermissionError, OSError) as e:
+            log.debug(f"Could not chown {file_path}: {e}")
+
     def _deploy_sentinels(self):
         """Pre-deploy sentinel honeypot files in all target directories.
         
@@ -100,6 +118,9 @@ class Honeypot:
         This solves the timing problem where process-specific honeypot
         files are deployed too late (after ransomware already collected
         its file list).
+        
+        Files are chowned to match the directory owner so ransomware
+        running as a regular user can actually modify them.
         """
         if not self._target_dirs:
             log.warning("No target directories — cannot deploy sentinel files")
@@ -120,6 +141,7 @@ class Honeypot:
 
                 try:
                     file_path.write_text(content)
+                    self._make_user_writable(file_path)
                     content_hash = str(hash(content.encode('utf-8')))
                     self._sentinel_files.append(HoneypotFile(path=file_path, content_hash=content_hash))
                 except (PermissionError, OSError) as e:
@@ -190,6 +212,7 @@ class Honeypot:
 
                 try:
                     file_path.write_text(content)
+                    self._make_user_writable(file_path)
                     content_hash = str(hash(content.encode('utf-8')))
                     decoy_files.append(HoneypotFile(path=file_path, content_hash=content_hash))
                     log.debug(f"Created decoy: {file_path}")
