@@ -1,14 +1,3 @@
-"""
-detector.py — The Brain of the Ransomware Detection System
-
-Receives I/O alerts from the Monitor, tracks process states,
-and decides when to throttle, investigate, kill, or clear.
-
-State machine:
-    NORMAL → SUSPICIOUS → UNDER_INVESTIGATION → KILLED
-                                    └──────────→ CLEARED
-"""
-
 import os
 import sys
 import time
@@ -19,6 +8,7 @@ import threading
 from enum import Enum
 from dataclasses import dataclass, field
 
+from monitor import IOAlert
 from config import (
     IO_THRESHOLD_MBPS,
     SUSPICIOUS_DURATION_SEC,
@@ -27,62 +17,52 @@ from config import (
 )
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [Detector] %(message)s",
-    datefmt="%H:%M:%S"
-)
 log = logging.getLogger("Detector")
 
 # ── State machine ─────────────────────────────────────────────────────────────
 class State(Enum):
-    NORMAL             = "normal"
-    SUSPICIOUS         = "suspicious"
-    UNDER_INVESTIGATION= "under_investigation"
-    KILLED             = "killed"
-    CLEARED            = "cleared"
+    NORMAL = "normal"
+    SUSPICIOUS = "suspicious"
+    UNDER_INVESTIGATION = "under_investigation"
+    KILLED = "killed"
+    CLEARED = "cleared"
+
 
 # ── Data structures ───────────────────────────────────────────────────────────
 @dataclass
-class IOAlert:
-    """Message format from Monitor → Detector."""
-    pid:        int
-    name:       str
-    write_mbps: float
-    timestamp:  float = field(default_factory=time.time)
-
-@dataclass
 class Verdict:
     """Message format from Honeypot → Detector."""
-    pid:          int
+    pid: int
     is_ransomware: bool
+
 
 @dataclass
 class TrackedProcess:
     """Internal state for a process being monitored."""
-    pid:          int
-    name:         str
-    state:        State    = State.NORMAL
-    state_since:  float    = field(default_factory=time.time)
-    last_alert:   float    = field(default_factory=time.time)
+    pid: int
+    name: str
+    state: State = State.NORMAL
+    state_since: float = field(default_factory=time.time)
+    last_alert: float = field(default_factory=time.time)
+
 
 # ── Detector ──────────────────────────────────────────────────────────────────
 class Detector:
     def __init__(self, alert_queue: queue.Queue, verdict_queue: queue.Queue,
                  rate_limiter=None, honeypot=None):
         """
-        alert_queue   — Monitor puts IOAlert objects here
+        alert_queue — Monitor puts IOAlert objects here
         verdict_queue — Honeypot puts Verdict objects here
-        rate_limiter  — object with .throttle(pid) and .release(pid)
-        honeypot      — object with .deploy_for_process(pid)
+        rate_limiter — object with .throttle(pid) and .release(pid)
+        honeypot — object with .deploy_for_process(pid)
         """
-        self.alert_queue   = alert_queue
+        self.alert_queue = alert_queue
         self.verdict_queue = verdict_queue
-        self.rate_limiter  = rate_limiter
-        self.honeypot      = honeypot
+        self.rate_limiter = rate_limiter
+        self.honeypot = honeypot
 
         self.tracked: dict[int, TrackedProcess] = {}
-        self._lock    = threading.Lock()
+        self._lock = threading.Lock()
         self._running = False
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -122,7 +102,7 @@ class Detector:
                     proc = self.tracked[alert.pid]
                     if proc.state == State.SUSPICIOUS:
                         log.info(f"PID {alert.pid} ({alert.name}) I/O normalized — resetting to NORMAL")
-                        proc.state      = State.NORMAL
+                        proc.state = State.NORMAL
                         proc.state_since = time.time()
             return
 
@@ -138,7 +118,7 @@ class Detector:
 
             # ── NORMAL → SUSPICIOUS ───────────────────────────────────────
             if proc.state == State.NORMAL:
-                proc.state       = State.SUSPICIOUS
+                proc.state = State.SUSPICIOUS
                 proc.state_since = time.time()
                 log.info(f"PID {alert.pid} ({alert.name}) → SUSPICIOUS")
 
@@ -149,7 +129,7 @@ class Detector:
                          f"(threshold: {SUSPICIOUS_DURATION_SEC}s)")
 
                 if elapsed >= SUSPICIOUS_DURATION_SEC:
-                    proc.state       = State.UNDER_INVESTIGATION
+                    proc.state = State.UNDER_INVESTIGATION
                     proc.state_since = time.time()
                     log.warning(f"PID {alert.pid} ({alert.name}) → UNDER_INVESTIGATION")
                     self._escalate(proc)
@@ -192,7 +172,7 @@ class Detector:
                 if proc.state not in (State.NORMAL, State.KILLED, State.CLEARED):
                     if now - proc.last_alert > ALERT_EXPIRY_SEC:
                         log.info(f"PID {pid} ({proc.name}) went quiet — resetting to NORMAL")
-                        proc.state       = State.NORMAL
+                        proc.state = State.NORMAL
                         proc.state_since = now
 
     # ── Internal helpers ──────────────────────────────────────────────────────
@@ -215,7 +195,9 @@ class Detector:
         """Send SIGKILL to a process. Cross-platform safe."""
         try:
             if sys.platform == "win32":
-                os.system(f"taskkill /F /PID {pid}")
+                # Windows: use taskkill. PID is trusted internal value from /proc
+                # nosec: pid is from internal tracking, not user input
+                os.system(f"taskkill /F /PID {pid}")  # nosec
             else:
                 os.kill(pid, signal.SIGKILL)
             log.critical(f"PID {pid} killed.")
@@ -245,57 +227,3 @@ class Detector:
 
             # Cleanup stale processes
             self.check_stale_processes()
-
-
-# ── Fake stubs for standalone testing ─────────────────────────────────────────
-class FakeRateLimiter:
-    def throttle(self, pid): log.info(f"[FakeRateLimiter] Throttling PID {pid}")
-    def release(self, pid):  log.info(f"[FakeRateLimiter] Releasing PID {pid}")
-
-class FakeHoneypot:
-    def __init__(self, verdict_queue, answer_after=3.0, is_ransomware=True):
-        self.verdict_queue = verdict_queue
-        self.answer_after  = answer_after
-        self.is_ransomware = is_ransomware
-
-    def deploy_for_process(self, pid):
-        log.info(f"[FakeHoneypot] Watching PID {pid}, will respond in {self.answer_after}s")
-        def _respond():
-            time.sleep(self.answer_after)
-            self.verdict_queue.put(Verdict(pid=pid, is_ransomware=self.is_ransomware))
-        threading.Thread(target=_respond, daemon=True).start()
-
-
-# ── Standalone test ───────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    print("\n" + "="*55)
-    print("  DETECTOR — Standalone Test")
-    print("="*55 + "\n")
-
-    alert_queue   = queue.Queue()
-    verdict_queue = queue.Queue()
-
-    rate_limiter = FakeRateLimiter()
-    honeypot     = FakeHoneypot(verdict_queue, answer_after=3.0, is_ransomware=True)
-
-    detector = Detector(alert_queue, verdict_queue, rate_limiter, honeypot)
-    detector.start()
-
-    FAKE_PID  = 9999
-    FAKE_NAME = "evil_encrypt"
-
-    print(f"Sending alerts for PID {FAKE_PID} ({FAKE_NAME}) at 120 MB/s...\n")
-
-    # Send 10 alerts over 10 seconds — should trigger full state machine
-    for i in range(10):
-        alert_queue.put(IOAlert(pid=FAKE_PID, name=FAKE_NAME, write_mbps=120.0))
-        time.sleep(1)
-
-    # Give the honeypot time to respond + detector to process verdict
-    print("\nWaiting for honeypot verdict...\n")
-    time.sleep(5)
-
-    detector.stop()
-    print("\n" + "="*55)
-    print("  Test complete.")
-    print("="*55 + "\n")

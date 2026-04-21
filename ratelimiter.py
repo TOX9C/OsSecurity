@@ -23,8 +23,8 @@ def throttle(pid: int):
     if setup_cgroup():
         drives = get_drives_major_minor()
         for drive in drives:
-            subprocess.run(f"echo '{drive} wbps=1 rbps=1' | **sudo** tee {group_path}/io.max", shell=True)
-        subprocess.run(f"echo {pid} | **sudo** tee {group_path}/cgroup.procs", shell=True)
+            subprocess.run(f"echo '{drive} wbps=1 rbps=1' | sudo tee {group_path}/io.max", shell=True)
+        subprocess.run(f"echo {pid} | sudo tee {group_path}/cgroup.procs", shell=True)
         print(f"[RateLimiting]: PID {pid} is rate limited on {drives}...")
 
 def release(pid: int):

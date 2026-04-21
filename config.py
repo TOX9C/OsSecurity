@@ -11,6 +11,9 @@ SUSPICIOUS_DURATION_SEC = 5.0
 # (i.e. the process stopped doing heavy I/O)
 ALERT_EXPIRY_SEC = 3.0
 
+# How long the honeypot watches decoy files before clearing a process
+HONEYPOT_WATCH_SEC = 10.0
+
 # Processes allowed to do heavy I/O without triggering investigation
 WHITELISTED_PROCESSES = [
     # Package managers
