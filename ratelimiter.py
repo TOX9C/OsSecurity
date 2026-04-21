@@ -29,17 +29,25 @@ THROTTLE_WRITE_BPS = "1048576"   # 1 MB/s
 
 
 def get_drives_major_minor() -> list[str]:
-    """Get major:minor pairs for all block devices."""
+    """Get major:minor pairs for whole disk devices only (not partitions).
+    
+    cgroups v2 io.max only accepts whole disk devices (e.g., 8:0 for sda),
+    NOT partitions (e.g., 8:1 for sda1). Using partition major:minor numbers
+    causes 'No such device' errors.
+    """
     try:
+        # -d = no partitions (whole disks only), -n = no header, -o = output columns
         result = subprocess.run(
-            ["lsblk", "-no", "MAJ:MIN"],
+            ["lsblk", "-dno", "MAJ:MIN"],
             capture_output=True, text=True, check=True
         )
         drives = []
         for line in result.stdout.strip().splitlines():
             line = line.strip()
-            if ":" in line and line != "MAJ:MIN":
+            if ":" in line:
                 drives.append(line)
+        if drives:
+            log.info(f"Found block devices: {drives}")
         return drives
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         log.warning(f"Could not list drives with lsblk: {e}")
@@ -69,6 +77,9 @@ def _read_cgroup_file(path: str) -> str | None:
 def setup_cgroup() -> bool:
     """Create the throttle_jail cgroup. Returns True if ready."""
     if os.path.isdir(CGROUP_JAIL) and os.path.isfile(f"{CGROUP_JAIL}/io.max"):
+        # Clear any stale subtree_control from previous buggy runs
+        # (subtree_control +io on the jail prevents adding processes)
+        _write_cgroup_file(f"{CGROUP_JAIL}/cgroup.subtree_control", "-io")
         return True
 
     # Enable io controller in the root cgroup subtree
@@ -88,8 +99,10 @@ def setup_cgroup() -> bool:
         log.error("cgroup io.max not found after creation — cgroups v2 may not be available")
         return False
 
-    # Enable io controller in the jail cgroup too
-    _write_cgroup_file(f"{CGROUP_JAIL}/cgroup.subtree_control", "+io")
+    # NOTE: Do NOT enable subtree_control +io on the jail cgroup itself.
+    # In cgroups v2, a cgroup with controllers in subtree_control becomes
+    # an "internal" node and CANNOT have processes in it directly.
+    # The jail is a leaf cgroup — processes go here, not in children.
 
     log.info(f"cgroup jail created: {CGROUP_JAIL}")
     return True
