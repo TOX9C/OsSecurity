@@ -182,7 +182,7 @@ class Detector:
         """Throttle the process AND deploy the honeypot."""
         # Step 1: Throttle via cgroups to 1 MB/s
         if self.rate_limiter:
-            log.info(f"Throttling PID {proc.pid} to 1 MB/s")
+            log.info(f"Throttling PID {proc.pid} to 0.1 MB/s")
             self.rate_limiter.throttle(proc.pid)
         else:
             log.warning(f"[no rate limiter] Cannot throttle PID {proc.pid} — "

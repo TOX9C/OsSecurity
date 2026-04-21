@@ -22,10 +22,10 @@ log = logging.getLogger("RateLimiter")
 CGROUP_ROOT = "/sys/fs/cgroup"
 CGROUP_JAIL = f"{CGROUP_ROOT}/throttle_jail"
 
-# 1 MB/s = 1048576 bytes/s (cgroups uses bytes per second)
-# "max" means no limit; we set rbps/wbps to 1048576
-THROTTLE_READ_BPS = "1048576"    # 1 MB/s
-THROTTLE_WRITE_BPS = "1048576"   # 1 MB/s
+# 0.1 MB/s = 102400 bytes/s (cgroups uses bytes per second)
+# Aggressive throttle — process can barely write while honeypot verifies
+THROTTLE_READ_BPS = "102400"     # 0.1 MB/s (100 KB/s)
+THROTTLE_WRITE_BPS = "102400"    # 0.1 MB/s (100 KB/s)
 
 
 def get_drives_major_minor() -> list[str]:

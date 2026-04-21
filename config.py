@@ -2,11 +2,11 @@
 # Tweak these values and discuss the reasoning in your report
 
 # How fast is "suspiciously high" write speed (MB/s)
-IO_THRESHOLD_MBPS = 50.0
+IO_THRESHOLD_MBPS = 20.0
 
 # How often the monitor polls /proc for I/O stats (seconds)
 # Lower = faster detection, higher CPU usage
-MONITOR_INTERVAL = 0.25
+MONITOR_INTERVAL = 0.1
 
 # How many seconds of sustained high I/O before we escalate
 # (No longer used as a gate before throttling — throttle is immediate.
